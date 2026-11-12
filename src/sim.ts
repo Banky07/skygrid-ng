@@ -2,6 +2,11 @@
 // SkyGrid NG · shadow-mode airspace simulation engine (seeded, deterministic)
 // Simulated ADS-B / NiMet-style feeds. Advisory only — never issues clearances.
 // ─────────────────────────────────────────────────────────────────────────────
+import {
+  RULES, visFactor, stormFactor, diurnalFactor, ruleById,
+  evaluateFieldRules, conditionHolds, buildScorecard,
+} from './rules'
+import type { FieldInputs, RuleHit, RuleScore, InputValue } from './rules'
 
 export const MAP_W = 1000
 export const MAP_H = 780
@@ -23,6 +28,8 @@ export const nmDist = (aLon: number, aLat: number, bLon: number, bLat: number) =
 }
 
 export const clamp = (v: number, a: number, b: number) => Math.min(b, Math.max(a, v))
+// Placeholder: ground speed falls with altitude. Real figures need an aviation reviewer.
+export const altSpeedFactor = (alt: number) => 0.6 + 0.4 * clamp(alt / 35000, 0, 1)
 export const lerp = (a: number, b: number, t: number) => a + (b - a) * t
 export const round1 = (v: number) => Math.round(v * 10) / 10
 export const pad2 = (n: number) => String(n).padStart(2, '0')
@@ -80,10 +87,11 @@ export const AIRLINES = [
   { name: 'Max Air', code: 'MXJ', color: '#e2a86b' },
   { name: 'Allied Air', code: 'AJK', color: '#9aa7ff' },
 ]
+// Placeholder performance figures (ceiling in feet). Needs review by an aviation professional.
 const TYPES = [
-  { id: 'B738', cruise: 455 }, { id: 'B735', cruise: 440 }, { id: 'A320', cruise: 450 },
-  { id: 'E195', cruise: 445 }, { id: 'E145', cruise: 420 }, { id: 'CRJ9', cruise: 440 },
-  { id: 'AT72', cruise: 265 }, { id: 'D328', cruise: 295 },
+  { id: 'B738', cruise: 455, ceil: 37000 }, { id: 'B735', cruise: 440, ceil: 37000 }, { id: 'A320', cruise: 450, ceil: 37000 },
+  { id: 'E195', cruise: 445, ceil: 37000 }, { id: 'E145', cruise: 420, ceil: 35000 }, { id: 'CRJ9', cruise: 440, ceil: 37000 },
+  { id: 'AT72', cruise: 265, ceil: 25000 }, { id: 'D328', cruise: 295, ceil: 31000 },
 ]
 export const ROUTES: [string, string][] = [
   ['LOS', 'ABV'], ['LOS', 'PHC'], ['LOS', 'KAN'], ['ABV', 'PHC'], ['ABV', 'KAN'],
@@ -120,14 +128,28 @@ export interface Cell {
   vx: number; vy: number; born: number; life: number; tops: number
 }
 export type AdvType = 'METER' | 'CONVECTIVE' | 'RUNWAY' | 'LVP' | 'BRIEF'
-export type AdvStatus = 'pending' | 'accepted' | 'rejected' | 'expired'
+export type AdvStatus = 'pending' | 'concurred' | 'dismissed' | 'expired'
+export type AdvOutcome = 'still-valid' | 'cleared'
+export const DISMISS_REASONS = [
+  { id: 'not-relevant', label: 'Not relevant here' },
+  { id: 'already-handled', label: 'Already handled' },
+  { id: 'threshold-off', label: 'Threshold looks wrong' },
+  { id: 'other', label: 'Other' },
+] as const
 export interface Advisory {
   id: number; key: string; type: AdvType; sev: 'info' | 'caution' | 'warning'
-  code: string; title: string; body: string; conf: number; at: number; status: AdvStatus
+  code: string; title: string; body: string; at: number; atAbs: number; status: AdvStatus
   payload?: { rec?: string; cellId?: number }
+  ruleId: string; ruleVersion: string; inputs: Record<string, InputValue>
+  verifyAtAbs: number | null; outcome?: AdvOutcome; dismissReason?: string
 }
 export interface SimEvent { at: number; text: string; kind: 'wx' | 'ops' | 'ai' | 'sys' }
-export interface Decision { id: number; at: number; action: string; text: string }
+export interface Decision {
+  id: number; at: number; day: number; action: string; text: string
+  operator: string; simulatedEffect: boolean; reason?: string
+  advisoryId?: number; ruleId?: string; ruleVersion?: string; code?: string
+  inputs?: Record<string, InputValue>
+}
 export interface Layers { weather: boolean; routes: boolean; trails: boolean; labels: boolean }
 export interface Settings {
   speed: number; density: number; harmattan: number; storms: number
@@ -146,7 +168,7 @@ export interface World {
   counters: { arrived: number; departed: number; diverted: number }
   history: { t: number; v: number }[]
   acc: { spawn: number; cell: number; adv: number; hist: number; wind: number }
-  nextId: number; nextAdv: number; nextCell: number; cooldown: Record<string, number>
+  nextId: number; nextAdv: number; nextCell: number; nextDec: number; cooldown: Record<string, number>
 }
 export type Sel = { kind: 'flight'; id: number } | { kind: 'airport'; id: string } | null
 
@@ -173,10 +195,10 @@ export function bestRunway(dir: number, rwys: Runway[]): string {
   }
   return best.id
 }
-const diurnal = (h: number) => (h >= 7 && h <= 10 ? 1.25 : h >= 16 && h <= 19 ? 1.35 : h >= 11 && h <= 15 ? 1 : 0.55)
+const diurnal = diurnalFactor
 
 export interface FieldStats {
-  vis: number; cap: number; demand: number; rec: string; metering: boolean; lvp: boolean
+  vis: number; cap: number; demand: number; rawDemand: number; rec: string; metering: boolean; lvp: boolean
   storm: boolean; stormSev: number; stormDist: number; stormTops: number; activeRunway: string; wx: boolean
 }
 export function fieldStats(w: World, code: string): FieldStats {
@@ -185,20 +207,21 @@ export function fieldStats(w: World, code: string): FieldStats {
   let stormF = 1, nearest = Infinity, sev = 0, tops = 0
   for (const c of w.cells) {
     const d = nmDist(a.lon, a.lat, c.lon, c.lat)
-    if (d < effR(c, w.t) + 15) {
-      stormF = Math.min(stormF, c.sev === 3 ? 0.45 : c.sev === 2 ? 0.62 : 0.8)
+    if (d < effR(c, w.t) + RULES.capacity.stormBufferNm) {
+      stormF = Math.min(stormF, stormFactor(c.sev))
       if (d < nearest) { nearest = d; sev = c.sev; tops = c.tops }
     }
   }
-  const visF = vis < 1200 ? 0.45 : vis < 2000 ? 0.6 : vis < 4000 ? 0.78 : vis < 6000 ? 0.9 : 1
-  const cap = Math.max(3, Math.round(a.cap * visF * stormF))
+  const visF = visFactor(vis)
+  const cap = Math.max(RULES.capacity.minCapacityPerHour, Math.round(a.cap * visF * stormF))
   const hour = Math.floor(w.t / 60) % 24
-  let demand = Math.round(a.weight * 1.35 * diurnal(hour))
-  for (const f of w.flights) if (f.destCode === code && f.phase !== 'LANDED' && f.eta - w.t <= 60) demand++
+  let demand = Math.round(a.weight * RULES.demand.weightMultiplier * diurnal(hour))
+  for (const f of w.flights) if (f.destCode === code && f.phase !== 'LANDED' && f.eta - w.t <= RULES.demand.lookaheadMin) demand++
+  const rawDemand = demand
   const metering = st.meterUntil > w.t
   if (metering) demand = Math.min(demand, cap)
   return {
-    vis, cap, demand, rec: bestRunway(w.settings.windDir, a.rwys), metering,
+    vis, cap, demand, rawDemand, rec: bestRunway(w.settings.windDir, a.rwys), metering,
     lvp: st.lvpAck > w.t, storm: stormF < 1, stormSev: sev, stormDist: nearest,
     stormTops: tops, activeRunway: st.activeRunway, wx: vis < 5000 || stormF < 1,
   }
@@ -240,7 +263,7 @@ function updateFlight(w: World, f: Flight, dt: number) {
   ;[f.lon, f.lat] = unproj(f.x, f.y)
   const prof = Math.min(1, p / 0.16, (1 - p) / 0.2)
   f.alt = Math.max(1200, Math.round((f.maxAlt * (0.25 + 0.75 * prof)) / 100) * 100)
-  f.gs = Math.round(f.cruise * (held ? 0.6 : 0.55 + 0.45 * prof))
+  f.gs = Math.round(f.cruise * altSpeedFactor(f.alt) * (held ? 0.6 : 0.8 + 0.2 * prof))
   f.phase = held ? 'HELD' : p < 0.16 ? 'CLIMB' : p > 0.8 ? 'DESCENT' : 'CRUISE'
   f.eta = w.t + (1 - p) * f.durationMin + Math.max(0, f.holdUntil - w.t)
   f.wx = false
@@ -268,8 +291,8 @@ function makeFlight(w: World, airborne: boolean): Flight {
     airline: al.name, airlineColor: al.color, type: ty.id, cruise: ty.cruise,
     originCode: o.code, destCode: d.code, from: { lon: o.lon, lat: o.lat }, to: { lon: d.lon, lat: d.lat },
     progress: airborne ? 0.05 + w.rng() * 0.8 : 0,
-    durationMin: (dist / ty.cruise) * 60 + 11,
-    maxAlt: Math.min(37000, Math.max(16000, Math.round((9000 + dist * 70) / 1000) * 1000)),
+    durationMin: 0,
+    maxAlt: Math.min(ty.ceil, 37000, Math.max(16000, Math.round((9000 + dist * 70) / 1000) * 1000)),
     bow: (w.rng() - 0.5) * 26,
     squawk: Array.from({ length: 4 }, () => Math.floor(w.rng() * 8)).join(''),
     delay: w.rng() < 0.5 ? 0 : Math.round(w.rng() * (8 + (w.settings.storms + w.settings.harmattan) / 6)),
@@ -277,6 +300,7 @@ function makeFlight(w: World, airborne: boolean): Flight {
     x: 0, y: 0, hdg: 0, lon: o.lon, lat: o.lat, alt: 0, gs: 0, eta: 0,
     phase: 'CLIMB', landedAt: 0, trail: [], lastTrail: 0, divertChecked: false,
   }
+  f.durationMin = (dist / (ty.cruise * altSpeedFactor(f.maxAlt * 0.9))) * 60 + 11
   updateFlight(w, f, 0)
   return f
 }
@@ -293,7 +317,7 @@ export function createWorld(sc: Scenario, seed?: number): World {
     flights: [], cells: [], airports: {}, advisories: [], events: [], decisions: [],
     counters: { arrived: Math.round(sc.start * 7.4), departed: 0, diverted: 0 },
     history: [], acc: { spawn: 0, cell: 0, adv: 0, hist: 0, wind: 0 },
-    nextId: 1, nextAdv: 1, nextCell: 1, cooldown: {},
+    nextId: 1, nextAdv: 1, nextCell: 1, nextDec: 1, cooldown: {},
   }
   for (const a of AIRPORTS) w.airports[a.code] = { activeRunway: bestRunway(sc.windDir, a.rwys), meterUntil: 0, lvpAck: 0 }
   const nC = Math.round(sc.storms / 16)
@@ -309,51 +333,47 @@ export function createWorld(sc: Scenario, seed?: number): World {
     : 'Traffic steady. Evening demand peak expected 17:00–19:00 WAT at LOS/ABV. Monitor flow against weather-adjusted capacity.'
   w.advisories.push({
     id: w.nextAdv++, key: 'BRIEF', type: 'BRIEF', sev: 'info', code: 'LOS',
-    title: `Operational brief — ${sc.label}`, body: briefBody, conf: 92, at: w.t, status: 'pending',
+    title: `Operational brief — ${sc.label}`, body: briefBody, at: w.t, atAbs: nowAbs(w), status: 'pending',
+    ruleId: 'BRIEF-01', ruleVersion: RULES.version, inputs: { scenario: sc.label }, verifyAtAbs: null,
   })
   evaluateAdvisories(w)
   return w
 }
 
 // ── Advisory engine ──────────────────────────────────────────────────────────
-function tryPush(w: World, a: Omit<Advisory, 'id' | 'at' | 'status'>, cond: boolean, baseConf: number) {
-  if (!cond) return
-  if (w.advisories.filter(x => x.status === 'pending').length >= 7) return
-  if (w.advisories.some(x => x.status === 'pending' && x.key === a.key)) return
-  const last = w.cooldown[a.key]
-  if (last !== undefined && w.t - last < 18) return
-  w.cooldown[a.key] = w.t
-  const adv: Advisory = { ...a, id: w.nextAdv++, at: w.t, status: 'pending', conf: Math.min(97, baseConf + Math.round(w.rng() * 8)) }
+// Rules and thresholds live in rules.json / rules.ts. This layer only gathers
+// inputs, applies pending-limit and cooldown housekeeping, and records advisories.
+const nowAbs = (w: World) => (w.day - 1) * 1440 + w.t
+
+function fieldInputs(w: World, code: string): FieldInputs {
+  const st = fieldStats(w, code)
+  return {
+    code, demand: st.demand, rawDemand: st.rawDemand, cap: st.cap, vis: st.vis,
+    storm: st.storm, stormSev: st.stormSev, stormDist: st.stormDist, stormTops: st.stormTops,
+    activeRunway: st.activeRunway, recRunway: st.rec, lvpActive: st.lvp,
+    windDir: w.settings.windDir, windKt: w.settings.windKt,
+  }
+}
+function pushAdvisory(w: World, h: RuleHit) {
+  const A = RULES.advisories
+  if (w.advisories.filter(x => x.status === 'pending').length >= A.maxPending) return
+  if (w.advisories.some(x => x.status === 'pending' && x.key === h.key)) return
+  const last = w.cooldown[h.key]
+  if (last !== undefined && nowAbs(w) - last < A.cooldownMin) return
+  w.cooldown[h.key] = nowAbs(w)
+  const rule = ruleById(h.ruleId)
+  const adv: Advisory = {
+    id: w.nextAdv++, key: h.key, type: h.type, sev: h.sev, code: h.code, title: h.title, body: h.body,
+    at: w.t, atAbs: nowAbs(w), status: 'pending', payload: h.payload,
+    ruleId: h.ruleId, ruleVersion: RULES.version, inputs: h.inputs,
+    verifyAtAbs: rule.verifyAfterMin == null ? null : nowAbs(w) + rule.verifyAfterMin,
+  }
   w.advisories.unshift(adv)
-  event(w, `AI advisory: ${adv.title}`, 'ai')
+  event(w, `Advisory ${adv.ruleId} — ${adv.title}`, 'ai')
 }
 export function evaluateAdvisories(w: World) {
-  for (const a of AIRPORTS.filter(x => x.weight >= 3.5)) {
-    const st = fieldStats(w, a.code)
-    tryPush(w, {
-      key: 'METER' + a.code, type: 'METER', sev: st.demand > st.cap * 1.35 ? 'warning' : 'caution', code: a.code,
-      title: `Flow metering — ${a.code}`,
-      body: `Projected ${st.demand} arrivals/hr against ${st.cap}/hr weather-adjusted capacity. Suggest ground holds or +2 min final spacing for ${Math.max(1, st.demand - st.cap)} aircraft.`,
-      conf: 0,
-    }, st.demand > st.cap * 1.08, 82)
-    tryPush(w, {
-      key: 'CONV' + a.code, type: 'CONVECTIVE', sev: 'warning', code: a.code,
-      title: `Convective cell — ${a.code}`,
-      body: `CB activity ${Math.round(st.stormDist)} NM from the field, tops FL${st.stormTops}. Expect approach disruption; vector arrivals around the cell and review alternate fuel.`,
-      conf: 0, payload: {},
-    }, st.storm && st.stormSev >= 2, 86)
-    tryPush(w, {
-      key: 'RWY' + a.code, type: 'RUNWAY', sev: 'info', code: a.code,
-      title: `Runway change — ${a.code}`,
-      body: `Surface wind ${Math.round(w.settings.windDir)}°/${Math.round(w.settings.windKt)} kt favours RWY ${st.rec} (currently ${st.activeRunway}). Coordinate change with tower.`,
-      conf: 0, payload: { rec: st.rec },
-    }, st.rec !== st.activeRunway && w.settings.windKt >= 8, 90)
-    tryPush(w, {
-      key: 'LVP' + a.code, type: 'LVP', sev: 'caution', code: a.code,
-      title: `Low visibility procedures — ${a.code}`,
-      body: `Harmattan haze reduces visibility to ${st.vis} m. Activate LVP; expect reduced arrival rate and increased spacing.`,
-      conf: 0,
-    }, st.vis < 1500 && !st.lvp, 88)
+  for (const a of AIRPORTS.filter(x => x.weight >= RULES.advisories.majorAirportMinWeight)) {
+    for (const h of evaluateFieldRules(fieldInputs(w, a.code))) pushAdvisory(w, h)
   }
 }
 
@@ -411,9 +431,13 @@ export function tick(w: World, dt: number) {
   }
   w.acc.adv += dt
   if (w.acc.adv > 45) { w.acc.adv = 0; evaluateAdvisories(w) }
+  const nowA = nowAbs(w)
   for (const a of w.advisories) {
-    if (a.status === 'pending' && w.t - a.at > 26 && a.type !== 'BRIEF') {
+    if (a.status === 'pending' && a.type !== 'BRIEF' && nowA - a.atAbs > RULES.advisories.expireAfterMin) {
       a.status = 'expired'; event(w, `Advisory expired — ${a.title}`, 'ai')
+    }
+    if (a.verifyAtAbs !== null && a.outcome === undefined && nowA >= a.verifyAtAbs) {
+      a.outcome = conditionHolds(a.ruleId, fieldInputs(w, a.code), a) ? 'still-valid' : 'cleared'
     }
   }
   w.acc.hist += dt
@@ -426,41 +450,52 @@ export function tick(w: World, dt: number) {
   }
 }
 
-// ── Human-in-the-loop decisions & commands (with undo) ───────────────────────
-export function applyDecision(w: World, id: number, accept: boolean): { label: string; undo: () => void } | null {
+// ── Human-in-the-loop decisions & what-if commands (with undo) ───────────────
+// Shadow mode: "concur" records the supervisor's judgement. Any change to the
+// simulated traffic picture is a what-if effect inside the simulator only.
+const OPERATOR = 'ATC SUP (sim)'
+function logDecision(w: World, action: string, text: string, a?: Advisory, simulatedEffect = false, reason?: string) {
+  w.decisions.unshift({
+    id: w.nextDec++, at: w.t, day: w.day, action, text, operator: OPERATOR, simulatedEffect, reason,
+    advisoryId: a?.id, ruleId: a?.ruleId, ruleVersion: a?.ruleVersion, code: a?.code, inputs: a?.inputs,
+  })
+  if (w.decisions.length > 500) w.decisions.pop()
+}
+export function applyDecision(w: World, id: number, concur: boolean, reason?: string): { label: string; undo: () => void } | null {
   const a = w.advisories.find(x => x.id === id)
   if (!a || a.status !== 'pending') return null
-  a.status = accept ? 'accepted' : 'rejected'
-  w.decisions.unshift({ id: w.nextId++, at: w.t, action: accept ? 'ACCEPTED' : 'DISMISSED', text: a.title })
-  if (w.decisions.length > 30) w.decisions.pop()
+  a.status = concur ? 'concurred' : 'dismissed'
+  if (!concur && reason) a.dismissReason = reason
+  logDecision(w, concur ? 'CONCURRED' : 'DISMISSED', a.title, a, concur && a.type !== 'BRIEF', concur ? undefined : reason)
   const ud: { meter?: number; ids?: number[]; rwy?: string; vec?: { id: number; bow: number; rr: boolean }[]; lvp?: number } = {}
-  if (accept) {
+  if (concur) {
     const st = w.airports[a.code]
     if (a.type === 'METER' && st) {
       ud.meter = st.meterUntil; st.meterUntil = w.t + 30; ud.ids = []
       for (const f of w.flights) if (f.destCode === a.code && f.phase !== 'LANDED' && f.progress < 0.92) { f.delay += 4; ud.ids.push(f.id) }
-      event(w, `Metering active ${a.code} until ${clockHM(w.t + 30)} WAT`, 'ops')
+      event(w, `Simulated: metering applied at ${a.code} until ${clockHM(w.t + 30)} WAT`, 'ops')
     } else if (a.type === 'RUNWAY' && st && a.payload?.rec) {
       ud.rwy = st.activeRunway; st.activeRunway = a.payload.rec
-      event(w, `${a.code} runway changed to ${a.payload.rec}`, 'ops')
+      event(w, `Simulated: ${a.code} runway change to ${a.payload.rec}`, 'ops')
     } else if (a.type === 'CONVECTIVE') {
       ud.vec = []
       for (const f of w.flights) if (f.destCode === a.code && f.phase !== 'LANDED' && f.progress < 0.95) {
         ud.vec.push({ id: f.id, bow: f.bow, rr: f.rerouted })
         f.bow = (f.bow >= 0 ? 1 : -1) * 72; f.rerouted = true
       }
-      event(w, `Vectors issued around CB — ${a.code} arrivals`, 'ops')
+      event(w, `Simulated: ${a.code} arrivals shown vectored around CB`, 'ops')
     } else if (a.type === 'LVP' && st) {
       ud.lvp = st.lvpAck; st.lvpAck = w.t + 45
-      event(w, `LVP activated ${a.code}`, 'ops')
+      event(w, `Simulated: LVP marked active at ${a.code}`, 'ops')
     } else if (a.type === 'BRIEF') {
       event(w, 'Operational brief acknowledged by supervisor', 'sys')
     }
   }
-  const label = accept ? `Accepted — ${a.title}` : `Dismissed — ${a.title}`
+  const label = concur ? `Concurred — ${a.title}` : `Dismissed — ${a.title}`
   const undo = () => {
     a.status = 'pending'
-    w.decisions.unshift({ id: w.nextId++, at: w.t, action: 'REVERTED', text: a.title })
+    delete a.dismissReason
+    logDecision(w, 'REVERTED', a.title, a)
     const st = w.airports[a.code]
     if (ud.meter !== undefined && st) st.meterUntil = ud.meter
     if (ud.ids) for (const f of w.flights) if (ud.ids.includes(f.id)) f.delay = Math.max(0, f.delay - 4)
@@ -475,17 +510,16 @@ export function flightCommand(w: World, id: number, cmd: 'vector' | 'hold' | 'cl
   if (!f || f.phase === 'LANDED') return null
   const prev = { bow: f.bow, rr: f.rerouted, hold: f.holdUntil, delay: f.delay }
   let label = ''
-  if (cmd === 'vector') { f.bow = (f.bow >= 0 ? 1 : -1) * 72; f.rerouted = true; label = `${f.callsign} vectored around weather` }
-  if (cmd === 'hold') { f.holdUntil = Math.max(f.holdUntil, w.t) + 5; f.delay += 5; label = `${f.callsign} holding +5 min` }
-  if (cmd === 'clear') { f.holdUntil = 0; f.rerouted = false; f.bow = (w.rng() - 0.5) * 20; label = `${f.callsign} resumed own navigation` }
+  if (cmd === 'vector') { f.bow = (f.bow >= 0 ? 1 : -1) * 72; f.rerouted = true; label = `${f.callsign}: simulated vector around weather` }
+  if (cmd === 'hold') { f.holdUntil = Math.max(f.holdUntil, w.t) + 5; f.delay += 5; label = `${f.callsign}: simulated hold +5 min` }
+  if (cmd === 'clear') { f.holdUntil = 0; f.rerouted = false; f.bow = (w.rng() - 0.5) * 20; label = `${f.callsign}: simulated resume` }
   event(w, label, 'ops')
-  w.decisions.unshift({ id: w.nextId++, at: w.t, action: 'COMMAND', text: label })
-  if (w.decisions.length > 30) w.decisions.pop()
+  logDecision(w, 'WHAT-IF', label, undefined, true)
   const undo = () => {
     const g = w.flights.find(x => x.id === id)
     if (!g) return
     g.bow = prev.bow; g.rerouted = prev.rr; g.holdUntil = prev.hold; g.delay = prev.delay
-    w.decisions.unshift({ id: w.nextId++, at: w.t, action: 'REVERTED', text: label })
+    logDecision(w, 'REVERTED', label, undefined, true)
   }
   return { label, undo }
 }
@@ -494,14 +528,14 @@ export function flightCommand(w: World, id: number, cmd: 'vector' | 'hold' | 'cl
 export interface Bucket { label: string; demand: number; capacity: number; over: boolean }
 export function forecast(w: World, code: string): Bucket[] {
   const a = AP[code], st = fieldStats(w, code)
-  const visF = st.vis < 1200 ? 0.45 : st.vis < 2000 ? 0.6 : st.vis < 4000 ? 0.78 : st.vis < 6000 ? 0.9 : 1
+  const visF = visFactor(st.vis)
   const nowStormF = st.storm ? st.cap / (a.cap * visF) : 1
   const out: Bucket[] = []
   for (let i = 0; i < 6; i++) {
     const tt = w.t + i * 60, hour = Math.floor(tt / 60) % 24
-    let dem = Math.round(a.weight * 1.35 * diurnal(hour))
+    let dem = Math.round(a.weight * RULES.demand.weightMultiplier * diurnal(hour))
     for (const f of w.flights) if (f.destCode === code && f.phase !== 'LANDED' && f.eta >= tt && f.eta < tt + 60) dem++
-    const cap = Math.max(3, Math.round(a.cap * visF * Math.min(1, nowStormF + i * 0.07)))
+    const cap = Math.max(RULES.capacity.minCapacityPerHour, Math.round(a.cap * visF * Math.min(1, nowStormF + i * RULES.capacity.stormRecoveryPerHour)))
     if (w.airports[code].meterUntil > tt) dem = Math.min(dem, cap)
     out.push({ label: pad2(hour) + ':00', demand: dem, capacity: cap, over: dem > cap })
   }
@@ -513,7 +547,7 @@ export interface Snap {
   kpis: { airborne: number; movements: number; avgDelay: number; wxFields: number; pending: number; load: number; diverted: number }
   flights: Flight[]; airports: SnapAirport[]
   cells: (Cell & { effR: number; env: number })[]
-  advisories: Advisory[]; events: SimEvent[]; decisions: Decision[]
+  advisories: Advisory[]; events: SimEvent[]; decisions: Decision[]; scorecard: RuleScore[]
   history: { t: number; v: number }[]; forecast: Bucket[]; hub: string
 }
 export function makeSnapshot(w: World, hub: string): Snap {
@@ -534,7 +568,7 @@ export function makeSnapshot(w: World, hub: string): Snap {
     flights, airports,
     cells: w.cells.map(c => ({ ...c, effR: effR(c, w.t), env: cellEnv(c, w.t) })),
     advisories: w.advisories.map(a => ({ ...a })),
-    events: [...w.events], decisions: [...w.decisions],
+    events: [...w.events], decisions: [...w.decisions], scorecard: buildScorecard(w.advisories),
     history: [...w.history], forecast: forecast(w, hub), hub,
   }
 }
@@ -550,3 +584,5 @@ export const STATUS_TONE: Record<string, string> = {
   CLIMB: 'ok', CRUISE: 'ok', DESCENT: 'ok', DELAYED: 'warn', 'WX RISK': 'storm',
   DIVERTED: 'bad', HELD: 'cyan', LANDED: 'dim',
 }
+export type { RuleScore } from './rules'
+export { RULES } from './rules'

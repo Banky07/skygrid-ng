@@ -1,7 +1,8 @@
 import { useEffect, useMemo, useState } from 'react'
 import {
-  AIRPORTS, SCENARIOS, clockHM, fmtFL, flightStatus, STATUS_TONE, nmDist, proj,
+  AIRPORTS, SCENARIOS, DISMISS_REASONS, clockHM, fmtFL, flightStatus, STATUS_TONE, nmDist, proj,
 } from './sim'
+import { RULES } from './sim'
 import type { Snap, Settings, Sel, Flight, SnapAirport, Advisory } from './sim'
 import { Icon, Slider, Toggle, Chip } from './ui'
 
@@ -76,17 +77,19 @@ export function ControlDeck({ settings, paused, scenario, onSettings, onPause, o
 // ── Advisory rail ────────────────────────────────────────────────────────────
 const ADV_ICON: Record<string, string> = { METER: 'gauge', CONVECTIVE: 'bolt', RUNWAY: 'wind', LVP: 'haze', BRIEF: 'info' }
 
-export function AdvisoryRail({ snap, onDecide }: { snap: Snap; onDecide: (id: number, accept: boolean) => void }) {
-  const [tab, setTab] = useState<'pending' | 'log' | 'feed'>('pending')
+export function AdvisoryRail({ snap, onDecide }: { snap: Snap; onDecide: (id: number, accept: boolean, reason?: string) => void }) {
+  const [tab, setTab] = useState<'pending' | 'log' | 'score' | 'feed'>('pending')
   const pending = snap.advisories.filter(a => a.status === 'pending')
   return (
     <section className="panel rail">
       <div className="rail-banner mono"><Icon name="radar" size={13} /> AI RECOMMENDS · YOU DECIDE</div>
+      <div className="rail-note mono">Rules v{RULES.version} · placeholder thresholds · simulated data</div>
       <div className="tabs">
         <button className={'tab' + (tab === 'pending' ? ' on' : '')} onClick={() => setTab('pending')}>
           Advisories {pending.length > 0 && <span className="tab-badge">{pending.length}</span>}
         </button>
         <button className={'tab' + (tab === 'log' ? ' on' : '')} onClick={() => setTab('log')}>Decision log</button>
+        <button className={'tab' + (tab === 'score' ? ' on' : '')} onClick={() => setTab('score')}>Scorecard</button>
         <button className={'tab' + (tab === 'feed' ? ' on' : '')} onClick={() => setTab('feed')}>Activity</button>
       </div>
 
@@ -101,18 +104,19 @@ export function AdvisoryRail({ snap, onDecide }: { snap: Snap; onDecide: (id: nu
       {tab === 'log' && (
         <div className="log-list">
           {snap.decisions.length === 0 && (
-            <div className="empty"><Icon name="eye" size={26} /><p>Your accept / dismiss decisions are logged here as an audit trail.</p></div>
+            <div className="empty"><Icon name="eye" size={26} /><p>Your concur / dismiss decisions are logged here as an audit trail.</p></div>
           )}
           {snap.decisions.map(d => (
             <div className="log-item" key={d.id}>
               <span className="mono log-time">{clockHM(d.at)}</span>
-              <Chip tone={d.action === 'ACCEPTED' ? 'ok' : d.action === 'DISMISSED' ? 'dim' : d.action === 'REVERTED' ? 'warn' : 'cyan'}>{d.action}</Chip>
-              <span className="log-text">{d.text}</span>
-              <span className="log-actor mono">ATC SUP (you)</span>
+              <Chip tone={d.action === 'CONCURRED' ? 'ok' : d.action === 'DISMISSED' ? 'dim' : d.action === 'REVERTED' ? 'warn' : 'cyan'}>{d.action}</Chip>
+              <span className="log-text">{d.text}{d.reason ? ' · ' + (DISMISS_REASONS.find(r => r.id === d.reason)?.label ?? d.reason) : ''}</span>
+              <span className="log-actor mono">{d.ruleId ? d.ruleId + ' · ' : ''}{d.operator}</span>
             </div>
           ))}
         </div>
       )}
+      {tab === 'score' && <Scorecard snap={snap} />}
       {tab === 'feed' && (
         <div className="feed-list">
           {snap.events.map((e, i) => (
@@ -128,7 +132,8 @@ export function AdvisoryRail({ snap, onDecide }: { snap: Snap; onDecide: (id: nu
   )
 }
 
-function AdvCard({ a, t, onDecide }: { a: Advisory; t: number; onDecide: (id: number, accept: boolean) => void }) {
+function AdvCard({ a, t, onDecide }: { a: Advisory; t: number; onDecide: (id: number, accept: boolean, reason?: string) => void }) {
+  const [asking, setAsking] = useState(false)
   return (
     <article className={'adv sev-' + a.sev}>
       <div className="adv-head">
@@ -137,18 +142,74 @@ function AdvCard({ a, t, onDecide }: { a: Advisory; t: number; onDecide: (id: nu
         <Chip tone={a.sev === 'warning' ? 'bad' : a.sev === 'caution' ? 'warn' : 'cyan'}>{a.sev.toUpperCase()}</Chip>
       </div>
       <p className="adv-body">{a.body}</p>
-      <div className="adv-conf">
-        <span className="mono">CONFIDENCE {a.conf}%</span>
-        <span className="conf-bar"><i style={{ width: a.conf + '%' }} /></span>
-      </div>
+      <div className="adv-rule mono">{a.ruleId} · rules v{a.ruleVersion}</div>
+      {a.type !== 'BRIEF' && (
+        <div className="adv-inputs">
+          {Object.entries(a.inputs).map(([k, v]) => <span key={k}>{k} <b>{String(v)}</b></span>)}
+        </div>
+      )}
+      {asking && (
+        <div className="adv-ask" role="group" aria-label="Reason for dismissing">
+          <span className="adv-ask-label">Why dismiss?</span>
+          <div className="reasons">
+            {DISMISS_REASONS.map(r => (
+              <button key={r.id} className="btn ghost sm" onClick={() => onDecide(a.id, false, r.id)}>{r.label}</button>
+            ))}
+            <button className="btn ghost sm" onClick={() => setAsking(false)}>Cancel</button>
+          </div>
+        </div>
+      )}
       <div className="adv-foot">
         <span className="mono adv-time">{clockHM(a.at)} WAT · {Math.max(0, Math.round(t - a.at))}m ago</span>
-        <div>
-          <button className="btn ghost sm" onClick={() => onDecide(a.id, false)}>Dismiss</button>
-          <button className="btn primary sm" onClick={() => onDecide(a.id, true)}><Icon name="check" size={13} />Accept</button>
-        </div>
+        {!asking && (
+          <div>
+            <button className="btn ghost sm" onClick={() => (a.type === 'BRIEF' ? onDecide(a.id, false) : setAsking(true))}>Dismiss</button>
+            <button className="btn primary sm" onClick={() => onDecide(a.id, true)}><Icon name="check" size={13} />Concur</button>
+          </div>
+        )}
       </div>
     </article>
+  )
+}
+
+function Scorecard({ snap }: { snap: Snap }) {
+  const pct = (n: number, d: number) => (d > 0 ? Math.round((n / d) * 100) + '%' : '–')
+  return (
+    <div className="score">
+      <p className="score-note">
+        Rules v{RULES.version} ({RULES.status}). “Still valid” means the condition that raised an advisory
+        was still present after its check window. It shows whether a rule fired on a lasting situation, not
+        whether following it improved anything.
+      </p>
+      <table>
+        <thead>
+          <tr><th>Rule</th><th>Raised</th><th>Concur</th><th>Dismiss</th><th>Expired</th><th>Still valid</th></tr>
+        </thead>
+        <tbody>
+          {snap.scorecard.map(r => (
+            <tr key={r.ruleId}>
+              <td><span className="mono">{r.ruleId}</span><br /><span className="score-name">{r.name}</span></td>
+              <td>{r.raised || '–'}</td>
+              <td>{r.concurred || '–'}</td>
+              <td>{r.dismissed || '–'}</td>
+              <td>{r.expired || '–'}</td>
+              <td>{r.verified ? `${r.stillValid}/${r.verified} (${pct(r.stillValid, r.verified)})` : '–'}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+      {snap.scorecard.some(r => Object.keys(r.reasons).length > 0) && (
+        <div className="score-reasons">
+          <span className="score-name">Dismissal reasons</span>
+          {snap.scorecard.filter(r => Object.keys(r.reasons).length > 0).map(r => (
+            <p key={r.ruleId}>
+              <span className="mono">{r.ruleId}</span>{' '}
+              {Object.entries(r.reasons).map(([id, n]) => `${DISMISS_REASONS.find(x => x.id === id)?.label ?? id} ×${n}`).join(', ')}
+            </p>
+          ))}
+        </div>
+      )}
+    </div>
   )
 }
 
@@ -427,11 +488,11 @@ function FlightDetail({ f, snap, onCommand, onClose }: {
         </div>
       </div>
       <div className="d-section">
-        <span className="d-label">Supervisor commands (advisory simulation)</span>
+        <span className="d-label">What-if simulation (nothing is sent to aircraft)</span>
         <div className="d-actions">
-          <button className="btn sm" disabled={landed} onClick={() => onCommand(f.id, 'vector')}><Icon name="crosshair" size={13} />Vector around WX</button>
-          <button className="btn sm" disabled={landed} onClick={() => onCommand(f.id, 'hold')}><Icon name="pause" size={13} />Hold +5 min</button>
-          <button className="btn sm" disabled={landed || (f.phase !== 'HELD' && !f.rerouted)} onClick={() => onCommand(f.id, 'clear')}><Icon name="play" size={13} />Resume</button>
+          <button className="btn sm" disabled={landed} onClick={() => onCommand(f.id, 'vector')}><Icon name="crosshair" size={13} />Simulate vector</button>
+          <button className="btn sm" disabled={landed} onClick={() => onCommand(f.id, 'hold')}><Icon name="pause" size={13} />Simulate hold +5 min</button>
+          <button className="btn sm" disabled={landed || (f.phase !== 'HELD' && !f.rerouted)} onClick={() => onCommand(f.id, 'clear')}><Icon name="play" size={13} />Simulate resume</button>
         </div>
       </div>
     </>
@@ -503,4 +564,4 @@ export function Toasts({ items, onUndo, onDismiss }: { items: Toast[]; onUndo: (
       ))}
     </div>
   )
-}
+}

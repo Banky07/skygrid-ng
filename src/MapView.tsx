@@ -16,6 +16,8 @@ function MapViewBase({ world, sel, onSelect }: { world: World; frame: number; se
   const w = world
   const L = w.settings.layers
   const airborne = w.flights.filter(f => f.phase !== 'LANDED')
+  // Declutter: label only selected tracks, trouble (weather, diverted, held), or approaches into a field with a pending advisory.
+  const flaggedFields = new Set(w.advisories.filter(a => a.status === 'pending' && a.type !== 'BRIEF').map(a => a.code))
   const hazeY = proj(0, 8)[1]
   const windFlow = (w.settings.windDir + 180) % 360
 
@@ -143,7 +145,7 @@ function MapViewBase({ world, sel, onSelect }: { world: World; frame: number; se
                 <path d="M0 -8 L2 -2 L8 2 L2 3 L1 8 L0 6 L-1 8 L-2 3 L-8 2 L-2 -2 Z" fill="currentColor" />
               </g>
               {selected && <circle cx={f.x} cy={f.y} r={15} className="sel-ring" />}
-              {L.labels && (
+              {L.labels && (selected || f.wx || f.diverted || f.phase === 'HELD' || (f.phase === 'DESCENT' && flaggedFields.has(f.destCode))) && (
                 <text x={f.x + 11} y={f.y - 9} className="plane-label" pointerEvents="none">
                   {f.callsign} · {fmtFL(f.alt)}
                 </text>
@@ -179,4 +181,4 @@ function MapViewBase({ world, sel, onSelect }: { world: World; frame: number; se
 }
 
 const MapView = memo(MapViewBase, (a, b) => a.frame === b.frame && a.sel === b.sel && a.world === b.world)
-export default MapView
+export default MapView

@@ -1,0 +1,81 @@
+{
+  "ruleSet": "skygrid-ng-rules",
+  "version": "0.2.0",
+  "status": "placeholder",
+  "note": "Every threshold in this file is a placeholder until confirmed by ATC or airport operations staff. Not for operational use.",
+  "capacity": {
+    "visibilityFactors": [
+      { "belowM": 1200, "factor": 0.45 },
+      { "belowM": 2000, "factor": 0.6 },
+      { "belowM": 4000, "factor": 0.78 },
+      { "belowM": 6000, "factor": 0.9 }
+    ],
+    "stormFactorBySeverity": { "1": 0.8, "2": 0.62, "3": 0.45 },
+    "stormBufferNm": 15,
+    "minCapacityPerHour": 3,
+    "stormRecoveryPerHour": 0.07
+  },
+  "demand": {
+    "weightMultiplier": 1.35,
+    "lookaheadMin": 60,
+    "diurnal": [
+      { "fromHour": 7, "toHour": 10, "factor": 1.25 },
+      { "fromHour": 11, "toHour": 15, "factor": 1.0 },
+      { "fromHour": 16, "toHour": 19, "factor": 1.35 }
+    ],
+    "offPeakFactor": 0.55
+  },
+  "advisories": {
+    "maxPending": 7,
+    "cooldownMin": 18,
+    "expireAfterMin": 26,
+    "majorAirportMinWeight": 3.5,
+    "rules": [
+      {
+        "id": "FLOW-METER-01",
+        "name": "Flow metering",
+        "type": "METER",
+        "severity": "caution",
+        "verifyAfterMin": 30,
+        "params": { "demandOverCapacityRatio": 1.08, "warningRatio": 1.35 },
+        "description": "Projected arrivals per hour exceed weather-adjusted capacity."
+      },
+      {
+        "id": "CB-APPROACH-01",
+        "name": "Convective cell",
+        "type": "CONVECTIVE",
+        "severity": "warning",
+        "verifyAfterMin": 20,
+        "params": { "minCellSeverity": 2 },
+        "description": "A convective cell of at least the minimum severity is affecting the approach."
+      },
+      {
+        "id": "RWY-WIND-01",
+        "name": "Runway change",
+        "type": "RUNWAY",
+        "severity": "info",
+        "verifyAfterMin": 30,
+        "params": { "minWindKt": 8 },
+        "description": "Surface wind favours a different runway than the one in use."
+      },
+      {
+        "id": "LVP-VIS-01",
+        "name": "Low visibility procedures",
+        "type": "LVP",
+        "severity": "caution",
+        "verifyAfterMin": 30,
+        "params": { "visibilityBelowM": 1500 },
+        "description": "Visibility is below the level at which LVP would be considered."
+      },
+      {
+        "id": "BRIEF-01",
+        "name": "Operational brief",
+        "type": "BRIEF",
+        "severity": "info",
+        "verifyAfterMin": null,
+        "params": {},
+        "description": "Scenario-level briefing. Not verified."
+      }
+    ]
+  }
+}

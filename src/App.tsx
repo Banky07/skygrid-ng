@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import {
+  RULES,
   createWorld, tick, makeSnapshot, applyDecision, flightCommand,
   SCENARIOS, clockHM, clockHMS,
 } from './sim'
@@ -101,9 +102,9 @@ export default function App() {
     undo(); refresh(); pushToast('Action reverted')
   }, [refresh, pushToast])
 
-  const onDecide = useCallback((id: number, accept: boolean) => {
+  const onDecide = useCallback((id: number, accept: boolean, reason?: string) => {
     const w = worldRef.current!
-    const res = applyDecision(w, id, accept)
+    const res = applyDecision(w, id, accept, reason)
     if (!res) return
     refresh()
     pushToast(res.label, guardUndo(w, res.undo))
@@ -126,6 +127,7 @@ export default function App() {
     const payload = {
       product: 'SkyGrid NG', mode: 'shadow', exportedAt: new Date().toISOString(),
       sim: { day: s.day, timeWAT: clockHM(s.t), seed: w.seed },
+      rules: { ruleSet: RULES.ruleSet, version: RULES.version, status: RULES.status, note: RULES.note },
       settings: w.settings, kpis: s.kpis,
       flights: s.flights.map(f => ({
         callsign: f.callsign, airline: f.airline, type: f.type, squawk: f.squawk,
@@ -133,7 +135,7 @@ export default function App() {
         alt: f.alt, gs: f.gs, etaWAT: clockHM(f.eta), delayMin: f.delay, phase: f.phase, wxRisk: f.wx,
       })),
       airports: s.airports.map(a => ({ code: a.code, icao: a.icao, activeRunway: a.activeRunway, visibilityM: a.vis, demand: a.demand, capacity: a.cap, metering: a.metering, lvp: a.lvp })),
-      advisories: s.advisories, decisions: s.decisions,
+      advisories: s.advisories, decisions: s.decisions, scorecard: s.scorecard,
     }
     const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' })
     const url = URL.createObjectURL(blob)
@@ -218,4 +220,4 @@ export default function App() {
         onDismiss={id => setToasts(prev => prev.filter(t => t.id !== id))} />
     </div>
   )
-}
+}

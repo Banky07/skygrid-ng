@@ -67,4 +67,4 @@ export function Toggle({ label, on, onChange }: { label: string; on: boolean; on
 
 export function Chip({ tone = 'dim', children }: { tone?: string; children: React.ReactNode }) {
   return <span className={'chip chip-' + tone}>{children}</span>
-}
+}
