@@ -1,7 +1,7 @@
 import { memo } from 'react'
 import {
   AIRPORTS, ROUTES, NIGERIA, AP, MAP_W, MAP_H, NM_PX, proj, effR, cellEnv, visAt,
-  flightStatus, STATUS_TONE, fmtFL,
+  flightStatus, STATUS_TONE, fmtFL, liveFor,
 } from './sim'
 import type { World, Sel } from './sim'
 import { Icon } from './ui'
@@ -19,7 +19,12 @@ function MapViewBase({ world, sel, onSelect }: { world: World; frame: number; se
   // Declutter: label only selected tracks, trouble (weather, diverted, held), or approaches into a field with a pending advisory.
   const flaggedFields = new Set(w.advisories.filter(a => a.status === 'pending' && a.type !== 'BRIEF').map(a => a.code))
   const hazeY = proj(0, 8)[1]
-  const windFlow = (w.settings.windDir + 180) % 360
+  // Wind readout: the real Lagos METAR in live mode, otherwise the simulator's setting.
+  const losWx = liveFor(w, 'LOS')
+  const windSrc = losWx ? 'LOS METAR' : 'SIM'
+  const windDirShown = losWx ? losWx.windDir : w.settings.windDir
+  const windKtShown = losWx ? losWx.windKt : w.settings.windKt
+  const windFlow = ((windDirShown ?? 0) + 180) % 360
 
   return (
     <div className="map-wrap">
@@ -161,10 +166,12 @@ function MapViewBase({ world, sel, onSelect }: { world: World; frame: number; se
           <span className="hud-sub mono">{airborne.length} AIRBORNE · {w.cells.length} CB CELLS · SIM FEED</span>
         </div>
         <div className="hud-right mono">
-          <svg width="26" height="26" viewBox="0 0 26 26" style={{ transform: `rotate(${windFlow}deg)` }}>
-            <path d="M13 3 L17 15 L13 12 L9 15 Z" fill="var(--cyan)" />
-          </svg>
-          <span>{Math.round(w.settings.windDir)}° / {Math.round(w.settings.windKt)}KT</span>
+          {windDirShown !== null && (
+            <svg width="26" height="26" viewBox="0 0 26 26" style={{ transform: `rotate(${windFlow}deg)` }}>
+              <path d="M13 3 L17 15 L13 12 L9 15 Z" fill="var(--cyan)" />
+            </svg>
+          )}
+          <span>{windSrc} · {windDirShown === null ? 'VRB' : Math.round(windDirShown) + '°'} / {Math.round(windKtShown)}KT</span>
         </div>
       </div>
 

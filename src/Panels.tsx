@@ -10,13 +10,17 @@ import { Icon, Slider, Toggle, Chip } from './ui'
 
 // ── KPI strip ────────────────────────────────────────────────────────────────
 export function KpiStrip({ k }: { k: Snap['kpis'] }) {
+  // In live mode only the weather at the live fields is real; tag the rest so nothing reads as real traffic.
+  const sim = k.liveMode ? 'SIM' : ''
   const cards = [
-    { icon: 'plane', label: 'Airborne now', value: String(k.airborne), sub: 'live tracks', tone: 'ok' },
-    { icon: 'tower', label: 'Movements today', value: String(k.movements), sub: `${k.diverted} diversions`, tone: 'cyan' },
-    { icon: 'clock', label: 'Avg delay', value: k.avgDelay + 'm', sub: 'network mean', tone: k.avgDelay >= 12 ? 'warn' : 'ok' },
-    { icon: 'haze', label: 'WX-impacted fields', value: String(k.wxFields), sub: 'of 12 airports', tone: k.wxFields > 3 ? 'warn' : 'ok' },
-    { icon: 'alert', label: 'Pending advisories', value: String(k.pending), sub: 'awaiting decision', tone: k.pending > 0 ? 'warn' : 'ok' },
-    { icon: 'gauge', label: 'Network load', value: Math.round(k.load * 100) + '%', sub: 'demand / capacity', tone: k.load > 1 ? 'bad' : k.load > 0.85 ? 'warn' : 'ok' },
+    { icon: 'plane', label: 'Airborne now', value: String(k.airborne), sub: k.liveMode ? 'simulated tracks' : 'live tracks', tone: 'ok', tag: sim },
+    { icon: 'tower', label: 'Movements today', value: String(k.movements), sub: `${k.diverted} diversions`, tone: 'cyan', tag: sim },
+    { icon: 'clock', label: 'Avg delay', value: k.avgDelay + 'm', sub: 'network mean', tone: k.avgDelay >= 12 ? 'warn' : 'ok', tag: sim },
+    k.liveMode
+      ? { icon: 'haze', label: 'WX-impacted fields', value: String(k.wxFields), sub: k.liveFields > 0 ? `of ${k.liveFields} live fields` : 'no live weather', tone: k.wxFields > 0 ? 'warn' : 'ok', tag: 'LIVE' }
+      : { icon: 'haze', label: 'WX-impacted fields', value: String(k.wxFields), sub: 'of 12 airports', tone: k.wxFields > 3 ? 'warn' : 'ok', tag: '' },
+    { icon: 'alert', label: 'Pending advisories', value: String(k.pending), sub: 'awaiting decision', tone: k.pending > 0 ? 'warn' : 'ok', tag: '' },
+    { icon: 'gauge', label: 'Network load', value: Math.round(k.load * 100) + '%', sub: 'demand / capacity', tone: k.load > 1 ? 'bad' : k.load > 0.85 ? 'warn' : 'ok', tag: sim },
   ]
   return (
     <section className="kpis">
@@ -24,7 +28,7 @@ export function KpiStrip({ k }: { k: Snap['kpis'] }) {
         <div className={'kpi kpi-' + c.tone} key={c.label}>
           <span className="kpi-ico"><Icon name={c.icon} size={17} /></span>
           <div>
-            <span className="kpi-label">{c.label}</span>
+            <span className="kpi-label">{c.label}{c.tag && <em className={'kpi-tag mono' + (c.tag === 'LIVE' ? ' live' : '')}>{c.tag}</em>}</span>
             <strong className="kpi-value mono">{c.value}</strong>
             <span className="kpi-sub">{c.sub}</span>
           </div>
@@ -121,7 +125,9 @@ export function AdvisoryRail({ snap, onDecide }: { snap: Snap; onDecide: (id: nu
   return (
     <section className="panel rail">
       <div className="rail-banner mono"><Icon name="radar" size={13} /> AI RECOMMENDS · YOU DECIDE</div>
-      <div className="rail-note mono">Rules v{RULES.version} · placeholder thresholds · simulated data</div>
+      <div className="rail-note mono">
+        Rules v{RULES.version} · placeholder thresholds · {snap.kpis.liveMode ? 'live weather at LOS, ABV · simulated traffic' : 'simulated data'}
+      </div>
       <div className="tabs">
         <button className={'tab' + (tab === 'pending' ? ' on' : '')} onClick={() => setTab('pending')}>
           Advisories {pending.length > 0 && <span className="tab-badge">{pending.length}</span>}
@@ -180,7 +186,13 @@ function AdvCard({ a, t, onDecide }: { a: Advisory; t: number; onDecide: (id: nu
         <Chip tone={a.sev === 'warning' ? 'bad' : a.sev === 'caution' ? 'warn' : 'cyan'}>{a.sev.toUpperCase()}</Chip>
       </div>
       <p className="adv-body">{a.body}</p>
-      <div className="adv-rule mono">{a.ruleId} · rules v{a.ruleVersion}</div>
+      <div className="adv-rule mono">
+        {a.ruleId} · rules v{a.ruleVersion}
+        {a.sourceObsMs !== undefined && (() => {
+          const age = Math.max(0, Math.round((Date.now() - a.sourceObsMs) / 60000))
+          return <> · <span className={'adv-age' + (age > RULES.live.staleAfterMin ? ' stale' : '')}>weather report {age} min old</span></>
+        })()}
+      </div>
       {a.type !== 'BRIEF' && (
         <div className="adv-inputs">
           {Object.entries(a.inputs).map(([k, v]) => <span key={k}>{k} <b>{String(v)}</b></span>)}

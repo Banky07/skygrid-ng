@@ -144,6 +144,7 @@ export interface Advisory {
   payload?: { rec?: string; cellId?: number }
   ruleId: string; ruleVersion: string; inputs: Record<string, InputValue>
   verifyAtAbs: number | null; outcome?: AdvOutcome; dismissReason?: string
+  sourceObsMs?: number   // observation time of the live METAR this advisory was raised from
 }
 export interface SimEvent { at: number; text: string; kind: 'wx' | 'ops' | 'ai' | 'sys' }
 export interface Decision {
@@ -392,6 +393,8 @@ function pushAdvisory(w: World, h: RuleHit) {
     verifyAtAbs: rule.verifyAfterMin == null ? null
       : nowAbs(w) + (h.inputs.source ? Math.max(rule.verifyAfterMin, RULES.live.minVerifyMin) : rule.verifyAfterMin),
   }
+  const lw = h.inputs.source ? liveFor(w, h.code) : null
+  if (lw) adv.sourceObsMs = lw.obsMs
   w.advisories.unshift(adv)
   event(w, `Advisory ${adv.ruleId} — ${adv.title}`, 'ai')
 }
@@ -583,7 +586,10 @@ export function forecast(w: World, code: string): Bucket[] {
 export interface SnapAirport extends Airport, FieldStats {}
 export interface Snap {
   t: number; day: number
-  kpis: { airborne: number; movements: number; avgDelay: number; wxFields: number; pending: number; load: number; diverted: number }
+  kpis: {
+    airborne: number; movements: number; avgDelay: number; wxFields: number; pending: number; load: number; diverted: number
+    liveMode: boolean; liveFields: number   // liveFields = fields currently using a usable live METAR
+  }
   flights: Flight[]; airports: SnapAirport[]
   cells: (Cell & { effR: number; env: number })[]
   advisories: Advisory[]; events: SimEvent[]; decisions: Decision[]; scorecard: RuleScore[]
@@ -600,7 +606,9 @@ export function makeSnapshot(w: World, hub: string): Snap {
     t: w.t, day: w.day,
     kpis: {
       airborne: airborne.length, movements: w.counters.arrived + w.counters.departed,
-      avgDelay, wxFields: airports.filter(a => a.wx).length,
+      avgDelay,
+      wxFields: airports.filter(a => a.wx && (!w.liveEnabled || a.wxSource !== undefined)).length,
+      liveMode: w.liveEnabled, liveFields: airports.filter(a => a.wxSource !== undefined).length,
       pending: w.advisories.filter(a => a.status === 'pending').length,
       load, diverted: w.counters.diverted,
     },

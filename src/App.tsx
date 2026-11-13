@@ -136,7 +136,7 @@ export default function App() {
     let cancelled = false
     const load = async () => {
       const ctrl = new AbortController()
-      const timer = window.setTimeout(() => ctrl.abort(), 10000)
+      const timer = window.setTimeout(() => ctrl.abort(), 20000)
       try {
         const r = await fetch('/api/metar?ids=DNMM,DNAA', { signal: ctrl.signal })
         if (!r.ok) throw new Error('HTTP ' + r.status)
@@ -146,7 +146,9 @@ export default function App() {
         worldRef.current!.live = data
         setLive({ data, fetchedAt: Date.now(), error: null })
       } catch (e) {
-        if (!cancelled) setLive({ ...liveRef.current, error: e instanceof Error ? e.message : 'request failed' })
+        const msg = e instanceof DOMException && e.name === 'AbortError' ? 'request timed out after 20 s'
+          : e instanceof Error ? e.message : 'request failed'
+        if (!cancelled) setLive({ ...liveRef.current, error: msg })
       } finally {
         window.clearTimeout(timer)
       }
@@ -272,7 +274,7 @@ export default function App() {
         </div>
         <footer className="foot">
           <span><Icon name="alert" size={12} /> {liveOn ? 'Hybrid mode: live NOAA METAR at LOS and ABV; traffic and all other weather simulated.' : 'Simulated ADS-B / NiMet-style feeds for demonstration.'} Advisory only — not for operational use. Controllers retain full authority.</span>
-          <span className="mono">SKYGRID NG v0.4 · REACT + VITE · DEPLOY: VERCEL</span>
+          <span className="mono">SKYGRID NG v0.4.2 · REACT + VITE · DEPLOY: VERCEL</span>
         </footer>
       </main>
 

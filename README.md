@@ -32,6 +32,18 @@ dismissed or expired, and how many were still valid after their check window (a 
 not proof the recommendation helped). The decision log keeps up to 500 entries with rule ID,
 rule version, inputs and operator.
 
+## v0.4.2 changes: METAR recorder
+- `.github/workflows/record-metar.yml` runs every 30 minutes on GitHub Actions and appends new Lagos (DNMM) and Abuja (DNAA) METARs to `data/metar/DNMM-DNAA.jsonl` on a separate `metar-data` branch. Start it by hand from the repo's Actions tab ("Record METARs", Run workflow).
+- Each row keeps the full report plus `seenAt` (when we first saw it), so report lateness can be measured against NOAA's `receiptTime`.
+- The data branch carries its own `vercel.json` that disables deployments, and `vercel.json` on main also disables deployments for `metar-data`, so recording does not trigger Vercel builds.
+- `scripts/record-metar.mjs` holds the merge logic; `npm test` now also runs `tests/recorder.test.mjs`.
+
+## v0.4.1 changes
+- The map's wind readout shows the real Lagos METAR wind (tagged "LOS METAR") in live mode and the simulator's wind (tagged "SIM") otherwise.
+- In live mode the KPI cards are tagged: SIM on simulated figures, LIVE on weather-impacted fields, which now counts only the fields actually using a usable live report ("of 2 live fields").
+- Advisories raised from a live METAR show how old that report is, in amber once it passes the stale threshold.
+- Live weather requests time out after 20 s with a plain-English error message.
+
 ## v0.4 changes (rules v0.3.0): live weather mode
 - New **Weather source** switch in the control deck: Simulated, or Live METAR for LOS (DNMM) and ABV (DNAA).
 - Live mode is a **hybrid**: weather at LOS and ABV is real (wind, visibility, thunderstorm / CB reports from the NOAA AviationWeather METAR feed). Traffic and all other weather are simulated, and a header badge and footer say so.

@@ -2,7 +2,7 @@
 import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 import { parseMetar, parseMetars } from '../src/wx'
-import { createWorld, fieldStats, evaluateAdvisories, setWeatherSource, liveFor, visAt, SCENARIOS, AIRPORTS } from '../src/sim'
+import { createWorld, fieldStats, evaluateAdvisories, setWeatherSource, liveFor, makeSnapshot, visAt, SCENARIOS, AIRPORTS } from '../src/sim'
 
 const fixture = JSON.parse(readFileSync(new URL('./fixtures/metar-2026-11-13.json', import.meta.url), 'utf8'))
 const rec = (icao: string, raw: string, extra: object = {}) => ({ icaoId: icao, obsTime: Math.floor(Date.now() / 1000), rawOb: raw, ...extra })
@@ -101,5 +101,33 @@ ok('variable wind does not change the active runway', () => {
   setWeatherSource(w, true)
   const f = fieldStats(w, 'LOS')
   assert.equal(f.windDir, null); assert.equal(f.rec, f.activeRunway)
+})
+ok('KPIs: live mode counts only live fields and says so', () => {
+  const { w } = calm('LOS')
+  w.cells = [cellAt(901, 'KAN')]                             // simulated storm over a non-live field
+  const simSnap = makeSnapshot(w, 'LOS')
+  assert.equal(simSnap.kpis.liveMode, false)
+  w.live = { LOS: parseMetar(rec('DNMM', 'METAR DNMM 131000Z 25003KT 4000 TSRA SCT013CB 31/24 Q1018'))!, ABV: parseMetars(fixture).ABV }
+  w.live.ABV = { ...w.live.ABV, obsMs: Date.now() - 20 * 60000 }
+  setWeatherSource(w, true)
+  const s = makeSnapshot(w, 'LOS')
+  assert.equal(s.kpis.liveMode, true); assert.equal(s.kpis.liveFields, 2)
+  assert.equal(s.kpis.wxFields, 1)                           // LOS has a reported thunderstorm; ABV is clear; KAN is not live
+})
+ok('KPIs: a field with an unusable report is not counted as live', () => {
+  const { w } = calm('LOS')
+  w.live = { LOS: parseMetars(fixture).LOS, ABV: { ...parseMetars(fixture).ABV, obsMs: Date.now() - 5 * 3600 * 1000 } }
+  w.live.LOS = { ...w.live.LOS, obsMs: Date.now() - 30 * 60000 }
+  setWeatherSource(w, true)
+  assert.equal(makeSnapshot(w, 'LOS').kpis.liveFields, 1)
+})
+ok('live advisories record the observation time of their report', () => {
+  const { w } = calm('LOS')
+  w.cells = []; w.advisories = []; w.cooldown = {}
+  const wx = parseMetar(rec('DNMM', 'METAR DNMM 131000Z 25003KT 4000 TSRA SCT013CB 31/24 Q1018'))!
+  w.live = { LOS: wx }; setWeatherSource(w, true)
+  evaluateAdvisories(w)
+  const a = w.advisories.find(x => x.ruleId === 'TS-REPORTED-01')!
+  assert.equal(a.sourceObsMs, wx.obsMs)
 })
 console.log(`\n${n} checks passed`)

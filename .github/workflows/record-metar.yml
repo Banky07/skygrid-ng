@@ -1,0 +1,58 @@
+name: Record METARs
+
+# Appends new Lagos and Abuja METARs to data/metar/DNMM-DNAA.jsonl on the metar-data branch.
+# Runs every 30 minutes (GitHub may delay scheduled runs) and can be started by hand from the Actions tab.
+on:
+  schedule:
+    - cron: '*/30 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: record-metar
+  cancel-in-progress: false
+
+jobs:
+  record:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Load existing record from the data branch
+        run: |
+          mkdir -p /tmp/data
+          git fetch origin metar-data:refs/remotes/origin/metar-data 2>/dev/null || true
+          if git show-ref --verify --quiet refs/remotes/origin/metar-data; then
+            git show origin/metar-data:data/metar/DNMM-DNAA.jsonl > /tmp/data/DNMM-DNAA.jsonl 2>/dev/null || true
+          fi
+
+      - name: Fetch and merge new METARs
+        run: node scripts/record-metar.mjs /tmp/data/DNMM-DNAA.jsonl
+
+      - name: Commit to the data branch
+        run: |
+          if git show-ref --verify --quiet refs/remotes/origin/metar-data; then
+            git checkout -q -B metar-data origin/metar-data
+          else
+            git checkout -q --orphan metar-data
+            git rm -rfq .
+          fi
+          mkdir -p data/metar
+          cp /tmp/data/DNMM-DNAA.jsonl data/metar/DNMM-DNAA.jsonl
+          # Keep Vercel from trying to build this data-only branch.
+          echo '{ "git": { "deploymentEnabled": false } }' > vercel.json
+          git config user.name "skygrid-recorder"
+          git config user.email "actions@users.noreply.github.com"
+          git add vercel.json data/metar
+          if git diff --cached --quiet; then
+            echo "No new reports to commit."
+          else
+            git commit -q -m "Record METARs"
+            git push origin metar-data
+          fi
