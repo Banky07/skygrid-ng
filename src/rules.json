@@ -1,6 +1,6 @@
 {
   "ruleSet": "skygrid-ng-rules",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "status": "placeholder",
   "note": "Every threshold in this file is a placeholder until confirmed by ATC or airport operations staff. Not for operational use.",
   "capacity": {
@@ -12,6 +12,7 @@
     ],
     "stormFactorBySeverity": { "1": 0.8, "2": 0.62, "3": 0.45 },
     "stormBufferNm": 15,
+    "tsReportedFactor": 0.62,
     "minCapacityPerHour": 3,
     "stormRecoveryPerHour": 0.07
   },
@@ -19,11 +20,21 @@
     "weightMultiplier": 1.35,
     "lookaheadMin": 60,
     "diurnal": [
+      { "fromHour": 5, "toHour": 5, "factor": 0.7 },
+      { "fromHour": 6, "toHour": 6, "factor": 0.95 },
       { "fromHour": 7, "toHour": 10, "factor": 1.25 },
       { "fromHour": 11, "toHour": 15, "factor": 1.0 },
-      { "fromHour": 16, "toHour": 19, "factor": 1.35 }
+      { "fromHour": 16, "toHour": 19, "factor": 1.35 },
+      { "fromHour": 20, "toHour": 20, "factor": 1.15 },
+      { "fromHour": 21, "toHour": 21, "factor": 0.9 },
+      { "fromHour": 22, "toHour": 22, "factor": 0.7 }
     ],
     "offPeakFactor": 0.55
+  },
+  "live": {
+    "staleAfterMin": 90,
+    "unusableAfterMin": 180,
+    "minVerifyMin": 75
   },
   "advisories": {
     "maxPending": 7,
@@ -66,6 +77,15 @@
         "verifyAfterMin": 30,
         "params": { "visibilityBelowM": 1500 },
         "description": "Visibility is below the level at which LVP would be considered."
+      },
+      {
+        "id": "TS-REPORTED-01",
+        "name": "Thunderstorm reported",
+        "type": "TSREP",
+        "severity": "warning",
+        "verifyAfterMin": 30,
+        "params": {},
+        "description": "A live METAR reports thunderstorm or cumulonimbus at the field."
       },
       {
         "id": "BRIEF-01",

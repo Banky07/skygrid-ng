@@ -18,8 +18,9 @@ interface RuleConfig {
   capacity: {
     visibilityFactors: { belowM: number; factor: number }[]
     stormFactorBySeverity: Record<string, number>
-    stormBufferNm: number; minCapacityPerHour: number; stormRecoveryPerHour: number
+    stormBufferNm: number; tsReportedFactor: number; minCapacityPerHour: number; stormRecoveryPerHour: number
   }
+  live: { staleAfterMin: number; unusableAfterMin: number; minVerifyMin: number }
   demand: {
     weightMultiplier: number; lookaheadMin: number
     diurnal: { fromHour: number; toHour: number; factor: number }[]
@@ -61,7 +62,9 @@ export interface FieldInputs {
   vis: number         // metres
   storm: boolean; stormSev: number; stormDist: number; stormTops: number
   activeRunway: string; recRunway: string; lvpActive: boolean
-  windDir: number; windKt: number
+  windDir: number | null; windKt: number
+  tsReported: boolean; tsKind?: string   // live METAR: thunderstorm / CB at the field
+  wxSource?: string                       // e.g. "METAR DNMM 1000Z" when weather is live
 }
 export interface RuleHit {
   ruleId: string; type: AdvType; sev: Severity; key: string; code: string
@@ -101,9 +104,9 @@ export function evaluateFieldRules(f: FieldInputs): RuleHit[] {
     hits.push({
       ruleId: rwy.id, type: 'RUNWAY', key: 'RWY' + f.code, code: f.code, sev: rwy.severity,
       title: `Runway change — ${f.code}`,
-      body: `Surface wind ${Math.round(f.windDir)}°/${Math.round(f.windKt)} kt favours RWY ${f.recRunway} (currently ${f.activeRunway}). Coordinate any change with the tower.`,
+      body: `Surface wind ${f.windDir === null ? 'VRB' : Math.round(f.windDir) + '°'}/${Math.round(f.windKt)} kt favours RWY ${f.recRunway} (currently ${f.activeRunway}). Coordinate any change with the tower.`,
       payload: { rec: f.recRunway },
-      inputs: { windDir: Math.round(f.windDir), windKt: Math.round(f.windKt), recommended: f.recRunway, active: f.activeRunway },
+      inputs: { windDir: f.windDir === null ? 'VRB' : Math.round(f.windDir), windKt: Math.round(f.windKt), recommended: f.recRunway, active: f.activeRunway },
     })
   }
 
@@ -116,6 +119,16 @@ export function evaluateFieldRules(f: FieldInputs): RuleHit[] {
       inputs: { visibilityM: f.vis },
     })
   }
+  const tsr = ruleOfType('TSREP')
+  if (f.tsReported) {
+    hits.push({
+      ruleId: tsr.id, type: 'TSREP', key: 'TSREP' + f.code, code: f.code, sev: tsr.severity,
+      title: `Thunderstorm reported — ${f.code}`,
+      body: 'The latest METAR reports thunderstorm or cumulonimbus at the field. Expect reduced arrival capacity and possible holding; review alternates and fuel.',
+      inputs: { reported: f.tsKind ?? 'TS' },
+    })
+  }
+  if (f.wxSource) for (const h of hits) h.inputs = { ...h.inputs, source: f.wxSource }
   return hits
 }
 
@@ -130,6 +143,7 @@ export function conditionHolds(ruleId: string, f: FieldInputs, adv: Pick<Advisor
     case 'CONVECTIVE': return f.storm && f.stormSev >= rule.params.minCellSeverity
     case 'RUNWAY': return adv.payload?.rec === f.recRunway && f.windKt >= rule.params.minWindKt
     case 'LVP': return f.vis < rule.params.visibilityBelowM
+    case 'TSREP': return f.tsReported
     default: return false
   }
 }

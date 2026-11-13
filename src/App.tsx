@@ -1,9 +1,11 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import {
   RULES,
-  createWorld, tick, makeSnapshot, applyDecision, flightCommand,
+  createWorld, tick, makeSnapshot, applyDecision, flightCommand, setWeatherSource,
   SCENARIOS, clockHM, clockHMS,
 } from './sim'
+import { parseMetars } from './wx'
+import type { LiveState } from './wx'
 import type { World, Scenario, Settings, Sel, Snap } from './sim'
 import MapView from './MapView'
 import { KpiStrip, ControlDeck, AdvisoryRail, FlightBoard, ChartsPanel, DetailDrawer, Toasts } from './Panels'
@@ -11,6 +13,8 @@ import type { Toast } from './Panels'
 import { Icon } from './ui'
 
 const TIME_SCALE = 0.5 // sim-minutes per real second at 1× (30× time)
+const LIVE_TIME_SCALE = 1 / 60 // live mode runs in real time
+const watHoursNow = () => { const d = new Date(); return ((d.getUTCHours() + 1) % 24) + d.getUTCMinutes() / 60 }
 
 export default function App() {
   const worldRef = useRef<World | null>(null)
@@ -27,6 +31,12 @@ export default function App() {
   const [hub, setHub] = useState('LOS')
   const [sel, setSel] = useState<Sel>(null)
   const [toasts, setToasts] = useState<Toast[]>([])
+  const [liveOn, setLiveOn] = useState(false)
+  const [liveState, setLiveState] = useState<LiveState>({ data: {}, fetchedAt: null, error: null })
+  const liveOnRef = useRef(false)
+  const liveRef = useRef<LiveState>({ data: {}, fetchedAt: null, error: null })
+  const setLiveFlag = useCallback((v: boolean) => { liveOnRef.current = v; setLiveOn(v) }, [])
+  const setLive = useCallback((s: LiveState) => { liveRef.current = s; setLiveState(s) }, [])
 
   const refresh = useCallback(() => {
     const w = worldRef.current!
@@ -41,7 +51,7 @@ export default function App() {
       const w = worldRef.current!
       const dtReal = Math.min(0.1, (now - last) / 1000)
       last = now
-      if (!w.paused) tick(w, dtReal * w.settings.speed * TIME_SCALE)
+      if (!w.paused) tick(w, dtReal * (w.liveEnabled ? LIVE_TIME_SCALE : w.settings.speed * TIME_SCALE))
       setFrame(f => (f + 1) % 1e9)
       snapAcc += dtReal
       if (snapAcc > 0.65) { snapAcc = 0; refresh() }
@@ -73,10 +83,11 @@ export default function App() {
   const loadScenario = useCallback((sc: Scenario, key: string, msg: string) => {
     configRef.current = sc
     worldRef.current = createWorld(sc)
+    setLiveFlag(false)
     setScenario(key); setPaused(false); setSel(null)
     refresh()
     pushToast(msg)
-  }, [refresh, pushToast])
+  }, [refresh, pushToast, setLiveFlag])
 
   const randomize = useCallback(() => {
     const sc: Scenario = {
@@ -93,9 +104,57 @@ export default function App() {
     loadScenario(SCENARIOS[key], key, `Scenario loaded — ${SCENARIOS[key].label}`)
   }, [loadScenario, randomize])
 
+  const startLive = useCallback(() => {
+    const sc: Scenario = {
+      key: 'live', label: 'Live weather', start: watHoursNow(), density: 55,
+      harmattan: 0, storms: 0, windDir: 210, windKt: 8,
+    }
+    configRef.current = sc
+    const w = createWorld(sc)
+    w.live = liveRef.current.data
+    setWeatherSource(w, true)
+    worldRef.current = w
+    setLiveFlag(true); setScenario('live'); setPaused(false); setSel(null)
+    refresh()
+    pushToast('Live mode: real METAR at LOS and ABV, traffic simulated')
+  }, [refresh, pushToast, setLiveFlag])
+
+  const onLive = useCallback((on: boolean) => {
+    if (on === liveOnRef.current) return
+    if (on) startLive()
+    else loadScenario(SCENARIOS.rush, 'rush', 'Back to simulated weather')
+  }, [startLive, loadScenario])
+
   const onReset = useCallback(() => {
+    if (liveOnRef.current) { startLive(); return }
     loadScenario(configRef.current, configRef.current.key, 'Scenario reset — fresh traffic picture')
-  }, [loadScenario])
+  }, [loadScenario, startLive])
+
+  // Live METAR polling (only while live mode is on). The server caches for 5 minutes.
+  useEffect(() => {
+    if (!liveOn) return
+    let cancelled = false
+    const load = async () => {
+      const ctrl = new AbortController()
+      const timer = window.setTimeout(() => ctrl.abort(), 10000)
+      try {
+        const r = await fetch('/api/metar?ids=DNMM,DNAA', { signal: ctrl.signal })
+        if (!r.ok) throw new Error('HTTP ' + r.status)
+        const data = parseMetars(await r.json())
+        if (Object.keys(data).length === 0) throw new Error('no METAR data returned')
+        if (cancelled) return
+        worldRef.current!.live = data
+        setLive({ data, fetchedAt: Date.now(), error: null })
+      } catch (e) {
+        if (!cancelled) setLive({ ...liveRef.current, error: e instanceof Error ? e.message : 'request failed' })
+      } finally {
+        window.clearTimeout(timer)
+      }
+    }
+    load()
+    const id = window.setInterval(load, 5 * 60 * 1000)
+    return () => { cancelled = true; window.clearInterval(id) }
+  }, [liveOn, setLive])
 
   const guardUndo = useCallback((w: World, undo: () => void) => () => {
     if (worldRef.current !== w) { pushToast('Session was reset — nothing to undo'); return }
@@ -128,6 +187,8 @@ export default function App() {
       product: 'SkyGrid NG', mode: 'shadow', exportedAt: new Date().toISOString(),
       sim: { day: s.day, timeWAT: clockHM(s.t), seed: w.seed },
       rules: { ruleSet: RULES.ruleSet, version: RULES.version, status: RULES.status, note: RULES.note },
+      weatherSource: w.liveEnabled ? 'live-metar-hybrid' : 'simulated',
+      liveWeather: w.liveEnabled ? w.live : undefined,
       settings: w.settings, kpis: s.kpis,
       flights: s.flights.map(f => ({
         callsign: f.callsign, airline: f.airline, type: f.type, squawk: f.squawk,
@@ -179,6 +240,7 @@ export default function App() {
           </div>
         </div>
         <span className="badge-shadow mono"><i />SHADOW MODE</span>
+        {liveOn && <span className="badge-live mono"><i />LIVE METAR · TRAFFIC SIMULATED</span>}
         <div className="clockbox">
           <strong className="clock mono">{clockHMS(w.t)} <em>WAT</em></strong>
           <span className="clock-sub mono">DAY {w.day} · {settings.speed}× {paused ? '· PAUSED' : ''}</span>
@@ -198,7 +260,7 @@ export default function App() {
             <section className="panel map-panel">
               <MapView world={w} frame={frame} sel={sel} onSelect={onSelect} />
             </section>
-            <ControlDeck settings={settings} paused={paused} scenario={scenario}
+            <ControlDeck settings={settings} paused={paused} scenario={scenario} liveOn={liveOn} live={liveState} onLive={onLive}
               onSettings={updateSettings} onPause={togglePause} onScenario={onScenario}
               onReset={onReset} onRandom={randomize} onExport={onExport} />
           </div>
@@ -209,8 +271,8 @@ export default function App() {
           <ChartsPanel snap={snap} hub={hub} onHub={onHub} />
         </div>
         <footer className="foot">
-          <span><Icon name="alert" size={12} /> Simulated ADS-B / NiMet-style feeds for demonstration. Advisory only — not for operational use. Controllers retain full authority.</span>
-          <span className="mono">SKYGRID NG v0.1 · REACT + VITE · DEPLOY: VERCEL</span>
+          <span><Icon name="alert" size={12} /> {liveOn ? 'Hybrid mode: live NOAA METAR at LOS and ABV; traffic and all other weather simulated.' : 'Simulated ADS-B / NiMet-style feeds for demonstration.'} Advisory only — not for operational use. Controllers retain full authority.</span>
+          <span className="mono">SKYGRID NG v0.4 · REACT + VITE · DEPLOY: VERCEL</span>
         </footer>
       </main>
 

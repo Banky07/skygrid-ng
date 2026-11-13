@@ -7,6 +7,8 @@ import {
   evaluateFieldRules, conditionHolds, buildScorecard,
 } from './rules'
 import type { FieldInputs, RuleHit, RuleScore, InputValue } from './rules'
+import { LIVE_CODES, sourceLabel } from './wx'
+import type { LiveWx } from './wx'
 
 export const MAP_W = 1000
 export const MAP_H = 780
@@ -127,7 +129,7 @@ export interface Cell {
   id: number; lon: number; lat: number; r: number; sev: 1 | 2 | 3
   vx: number; vy: number; born: number; life: number; tops: number
 }
-export type AdvType = 'METER' | 'CONVECTIVE' | 'RUNWAY' | 'LVP' | 'BRIEF'
+export type AdvType = 'METER' | 'CONVECTIVE' | 'RUNWAY' | 'LVP' | 'TSREP' | 'BRIEF'
 export type AdvStatus = 'pending' | 'concurred' | 'dismissed' | 'expired'
 export type AdvOutcome = 'still-valid' | 'cleared'
 export const DISMISS_REASONS = [
@@ -169,6 +171,7 @@ export interface World {
   history: { t: number; v: number }[]
   acc: { spawn: number; cell: number; adv: number; hist: number; wind: number }
   nextId: number; nextAdv: number; nextCell: number; nextDec: number; cooldown: Record<string, number>
+  live: Record<string, LiveWx>; liveEnabled: boolean   // live METAR at LOS / ABV (hybrid mode)
 }
 export type Sel = { kind: 'flight'; id: number } | { kind: 'airport'; id: string } | null
 
@@ -197,21 +200,35 @@ export function bestRunway(dir: number, rwys: Runway[]): string {
 }
 const diurnal = diurnalFactor
 
+// Live METAR for a field, or null when live mode is off, no report, or the report is too old to use.
+export function liveFor(w: World, code: string, nowMs = Date.now()): LiveWx | null {
+  if (!w.liveEnabled) return null
+  const wx = w.live[code]
+  if (!wx) return null
+  return (nowMs - wx.obsMs) / 60000 > RULES.live.unusableAfterMin ? null : wx
+}
+
 export interface FieldStats {
   vis: number; cap: number; demand: number; rawDemand: number; rec: string; metering: boolean; lvp: boolean
   storm: boolean; stormSev: number; stormDist: number; stormTops: number; activeRunway: string; wx: boolean
+  windDir: number | null; windKt: number; tsReported: boolean; tsKind?: string; wxSource?: string
 }
 export function fieldStats(w: World, code: string): FieldStats {
   const a = AP[code], st = w.airports[code]
-  const vis = visAt(w, a)
+  const lw = liveFor(w, code)            // real weather owns this field when available
+  const vis = lw ? lw.visM : visAt(w, a)
+  const windDir = lw ? lw.windDir : w.settings.windDir
+  const windKt = lw ? lw.windKt : w.settings.windKt
   let stormF = 1, nearest = Infinity, sev = 0, tops = 0
-  for (const c of w.cells) {
+  for (const c of (lw ? [] : w.cells)) {
     const d = nmDist(a.lon, a.lat, c.lon, c.lat)
     if (d < effR(c, w.t) + RULES.capacity.stormBufferNm) {
       stormF = Math.min(stormF, stormFactor(c.sev))
       if (d < nearest) { nearest = d; sev = c.sev; tops = c.tops }
     }
   }
+  const tsReported = !!lw && (lw.ts || lw.cb)
+  if (tsReported) stormF = Math.min(stormF, RULES.capacity.tsReportedFactor)
   const visF = visFactor(vis)
   const cap = Math.max(RULES.capacity.minCapacityPerHour, Math.round(a.cap * visF * stormF))
   const hour = Math.floor(w.t / 60) % 24
@@ -221,7 +238,10 @@ export function fieldStats(w: World, code: string): FieldStats {
   const metering = st.meterUntil > w.t
   if (metering) demand = Math.min(demand, cap)
   return {
-    vis, cap, demand, rawDemand, rec: bestRunway(w.settings.windDir, a.rwys), metering,
+    vis, cap, demand, rawDemand, metering, windDir, windKt, tsReported,
+    tsKind: lw ? (lw.ts ? 'TS' : lw.cb ? 'CB cloud' : undefined) : undefined,
+    wxSource: lw ? sourceLabel(lw) : undefined,
+    rec: windDir === null ? st.activeRunway : bestRunway(windDir, a.rwys),
     lvp: st.lvpAck > w.t, storm: stormF < 1, stormSev: sev, stormDist: nearest,
     stormTops: tops, activeRunway: st.activeRunway, wx: vis < 5000 || stormF < 1,
   }
@@ -317,7 +337,7 @@ export function createWorld(sc: Scenario, seed?: number): World {
     flights: [], cells: [], airports: {}, advisories: [], events: [], decisions: [],
     counters: { arrived: Math.round(sc.start * 7.4), departed: 0, diverted: 0 },
     history: [], acc: { spawn: 0, cell: 0, adv: 0, hist: 0, wind: 0 },
-    nextId: 1, nextAdv: 1, nextCell: 1, nextDec: 1, cooldown: {},
+    nextId: 1, nextAdv: 1, nextCell: 1, nextDec: 1, cooldown: {}, live: {}, liveEnabled: false,
   }
   for (const a of AIRPORTS) w.airports[a.code] = { activeRunway: bestRunway(sc.windDir, a.rwys), meterUntil: 0, lvpAck: 0 }
   const nC = Math.round(sc.storms / 16)
@@ -328,7 +348,8 @@ export function createWorld(sc: Scenario, seed?: number): World {
   for (let i = 14; i > 0; i--) w.history.push({ t: w.t - i * 5, v: round1(4 + rng() * 7 + (sc.storms + sc.harmattan) / 22) })
   event(w, `Shadow session initialised — ${sc.label}`, 'sys')
   const briefBody =
-    sc.storms > 60 ? 'Convective SIGMET active across the southern FIR. Expect approach disruption, vectors and possible diversions into LOS/ABV.'
+    sc.key === 'live' ? 'Live mode: LOS and ABV use the latest NOAA METAR for wind, visibility and thunderstorm reports. Traffic and all other weather are simulated.'
+    : sc.storms > 60 ? 'Convective SIGMET active across the southern FIR. Expect approach disruption, vectors and possible diversions into LOS/ABV.'
     : sc.harmattan > 60 ? 'Dense harmattan haze north of 9°N. Visibility below LVP minima likely at SKO/KAN/MIU — reduced arrival rates.'
     : 'Traffic steady. Evening demand peak expected 17:00–19:00 WAT at LOS/ABV. Monitor flow against weather-adjusted capacity.'
   w.advisories.push({
@@ -351,7 +372,8 @@ function fieldInputs(w: World, code: string): FieldInputs {
     code, demand: st.demand, rawDemand: st.rawDemand, cap: st.cap, vis: st.vis,
     storm: st.storm, stormSev: st.stormSev, stormDist: st.stormDist, stormTops: st.stormTops,
     activeRunway: st.activeRunway, recRunway: st.rec, lvpActive: st.lvp,
-    windDir: w.settings.windDir, windKt: w.settings.windKt,
+    windDir: st.windDir, windKt: st.windKt,
+    tsReported: st.tsReported, tsKind: st.tsKind, wxSource: st.wxSource,
   }
 }
 function pushAdvisory(w: World, h: RuleHit) {
@@ -366,7 +388,9 @@ function pushAdvisory(w: World, h: RuleHit) {
     id: w.nextAdv++, key: h.key, type: h.type, sev: h.sev, code: h.code, title: h.title, body: h.body,
     at: w.t, atAbs: nowAbs(w), status: 'pending', payload: h.payload,
     ruleId: h.ruleId, ruleVersion: RULES.version, inputs: h.inputs,
-    verifyAtAbs: rule.verifyAfterMin == null ? null : nowAbs(w) + rule.verifyAfterMin,
+    // METARs update about hourly, so a live-sourced advisory is checked no sooner than minVerifyMin.
+    verifyAtAbs: rule.verifyAfterMin == null ? null
+      : nowAbs(w) + (h.inputs.source ? Math.max(rule.verifyAfterMin, RULES.live.minVerifyMin) : rule.verifyAfterMin),
   }
   w.advisories.unshift(adv)
   event(w, `Advisory ${adv.ruleId} — ${adv.title}`, 'ai')
@@ -375,6 +399,21 @@ export function evaluateAdvisories(w: World) {
   for (const a of AIRPORTS.filter(x => x.weight >= RULES.advisories.majorAirportMinWeight)) {
     for (const h of evaluateFieldRules(fieldInputs(w, a.code))) pushAdvisory(w, h)
   }
+}
+
+// ── Weather source (simulated vs live METAR at LOS / ABV) ────────────────────
+// Switching sources expires pending advisories at the live fields, because they
+// were raised from the other weather picture, and clears their cooldowns.
+export function setWeatherSource(w: World, live: boolean) {
+  if (w.liveEnabled === live) return
+  w.liveEnabled = live
+  for (const a of w.advisories) {
+    if (a.status === 'pending' && a.type !== 'BRIEF' && LIVE_CODES.has(a.code)) a.status = 'expired'
+  }
+  for (const k of Object.keys(w.cooldown)) {
+    for (const c of LIVE_CODES) if (k.endsWith(c)) delete w.cooldown[k]
+  }
+  event(w, live ? 'Weather source: live METAR at LOS and ABV (traffic simulated)' : 'Weather source: simulated', 'sys')
 }
 
 // ── Tick ─────────────────────────────────────────────────────────────────────
@@ -397,7 +436,7 @@ export function tick(w: World, dt: number) {
   for (const f of w.flights) {
     updateFlight(w, f, dt)
     if (f.progress >= 1 && f.phase !== 'LANDED') {
-      f.phase = 'LANDED'; f.landedAt = w.t; w.counters.arrived++
+      f.phase = 'LANDED'; f.landedAt = w.t; f.alt = 0; f.gs = 0; w.counters.arrived++
       event(w, `${f.callsign} landed ${f.destCode}${f.diverted ? ' (diverted)' : ''}`, 'ops')
       continue
     }

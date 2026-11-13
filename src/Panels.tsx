@@ -3,6 +3,8 @@ import {
   AIRPORTS, SCENARIOS, DISMISS_REASONS, clockHM, fmtFL, flightStatus, STATUS_TONE, nmDist, proj,
 } from './sim'
 import { RULES } from './sim'
+import { LIVE_FIELDS, ageMin, describeWx } from './wx'
+import type { LiveState } from './wx'
 import type { Snap, Settings, Sel, Flight, SnapAirport, Advisory } from './sim'
 import { Icon, Slider, Toggle, Chip } from './ui'
 
@@ -33,8 +35,9 @@ export function KpiStrip({ k }: { k: Snap['kpis'] }) {
 }
 
 // ── Control deck (always visible, live) ──────────────────────────────────────
-export function ControlDeck({ settings, paused, scenario, onSettings, onPause, onScenario, onReset, onRandom, onExport }: {
+export function ControlDeck({ settings, paused, scenario, liveOn, live, onLive, onSettings, onPause, onScenario, onReset, onRandom, onExport }: {
   settings: Settings; paused: boolean; scenario: string
+  liveOn: boolean; live: LiveState; onLive: (on: boolean) => void
   onSettings: (p: Partial<Settings>) => void; onPause: () => void
   onScenario: (k: string) => void; onReset: () => void; onRandom: () => void; onExport: () => void
 }) {
@@ -45,7 +48,8 @@ export function ControlDeck({ settings, paused, scenario, onSettings, onPause, o
       <div className="panel-head">
         <span className="panel-title"><Icon name="layers" size={14} /> Simulation control deck</span>
         <div className="deck-actions">
-          <select className="sel" value={scenario} onChange={e => onScenario(e.target.value)} aria-label="Scenario">
+          <select className="sel" value={scenario} disabled={liveOn} onChange={e => onScenario(e.target.value)} aria-label="Scenario">
+            {liveOn && <option value="live">Live (real time)</option>}
             {Object.values(SCENARIOS).map(sc => <option key={sc.key} value={sc.key}>{sc.label}</option>)}
             <option value="custom">Custom mix</option>
           </select>
@@ -70,12 +74,46 @@ export function ControlDeck({ settings, paused, scenario, onSettings, onPause, o
         <Toggle label="Trails" on={s.layers.trails} onChange={v => setLayer('trails', v)} />
         <Toggle label="Labels" on={s.layers.labels} onChange={v => setLayer('labels', v)} />
       </div>
+      <div className="wx-row">
+        <span className="toggle-hint mono">WEATHER SOURCE</span>
+        <div className="seg" role="group" aria-label="Weather source">
+          <button className={'seg-btn' + (!liveOn ? ' on' : '')} onClick={() => onLive(false)}>Simulated</button>
+          <button className={'seg-btn' + (liveOn ? ' on' : '')} onClick={() => onLive(true)}>Live METAR · LOS, ABV</button>
+        </div>
+        {liveOn && (
+          <div className="wx-lines">
+            {Object.keys(live.data).length === 0 && !live.error && <p className="wx-line dim">Fetching live weather…</p>}
+            {Object.keys(live.data).length === 0 && live.error && (
+              <p className="wx-line stale">Live weather unavailable ({live.error}). LOS and ABV are using simulated weather.</p>
+            )}
+            {Object.values(LIVE_FIELDS).map(code => {
+              const wx = live.data[code]
+              if (!wx) return null
+              const age = ageMin(wx, Date.now())
+              const state = age > RULES.live.unusableAfterMin ? 'unusable' : age > RULES.live.staleAfterMin ? 'stale' : 'ok'
+              return (
+                <p key={code} className={'wx-line' + (state !== 'ok' ? ' stale' : '')}>
+                  <b className="mono">{code}</b> {describeWx(wx)} · {age} min old
+                  {state === 'stale' ? ' · STALE' : state === 'unusable' ? ' · TOO OLD, using simulated weather' : ''}
+                </p>
+              )
+            })}
+            {Object.keys(live.data).length > 0 && live.error && (
+              <p className="wx-line stale">Last refresh failed ({live.error}); showing the previous report.</p>
+            )}
+            <p className="wx-line dim">
+              Live mode runs in real time. Weather at LOS and ABV is real; traffic and all other weather are simulated,
+              and the sliders above affect simulated fields only.
+            </p>
+          </div>
+        )}
+      </div>
     </section>
   )
 }
 
 // ── Advisory rail ────────────────────────────────────────────────────────────
-const ADV_ICON: Record<string, string> = { METER: 'gauge', CONVECTIVE: 'bolt', RUNWAY: 'wind', LVP: 'haze', BRIEF: 'info' }
+const ADV_ICON: Record<string, string> = { METER: 'gauge', CONVECTIVE: 'bolt', TSREP: 'bolt', RUNWAY: 'wind', LVP: 'haze', BRIEF: 'info' }
 
 export function AdvisoryRail({ snap, onDecide }: { snap: Snap; onDecide: (id: number, accept: boolean, reason?: string) => void }) {
   const [tab, setTab] = useState<'pending' | 'log' | 'score' | 'feed'>('pending')
@@ -326,8 +364,8 @@ export function FlightBoard({ flights, sel, onSelect }: { flights: Flight[]; sel
                   <td className="mono">{f.type}</td>
                   <td className="mono route">{f.originCode} <Icon name="arrow" size={10} /> {f.destCode}{f.diverted && <span className="div-tag">DIV</span>}</td>
                   <td><Chip tone={STATUS_TONE[status]}>{status}</Chip></td>
-                  <td className="mono num">{fmtFL(f.alt)}</td>
-                  <td className="mono num">{f.gs}kt</td>
+                  <td className="mono num">{f.phase === 'LANDED' ? '—' : fmtFL(f.alt)}</td>
+                  <td className="mono num">{f.phase === 'LANDED' ? '—' : f.gs + 'kt'}</td>
                   <td className="mono num">{clockHM(f.eta)}</td>
                   <td className={'mono num' + (f.delay >= 8 ? ' delay-hot' : '')}>{f.delay > 0 ? '+' + f.delay + 'm' : '—'}</td>
                 </tr>
@@ -465,8 +503,8 @@ function FlightDetail({ f, snap, onCommand, onClose }: {
           <span>{f.destCode}{f.diverted && <em className="div-tag">DIV</em>}</span>
         </div>
         <div className="d-stats">
-          <div className="d-stat"><span>ALT</span><b className="mono">{fmtFL(f.alt)}</b></div>
-          <div className="d-stat"><span>GS</span><b className="mono">{f.gs}kt</b></div>
+          <div className="d-stat"><span>ALT</span><b className="mono">{f.phase === 'LANDED' ? '—' : fmtFL(f.alt)}</b></div>
+          <div className="d-stat"><span>GS</span><b className="mono">{f.phase === 'LANDED' ? '—' : f.gs + 'kt'}</b></div>
           <div className="d-stat"><span>ETA</span><b className="mono">{clockHM(f.eta)}</b></div>
           <div className="d-stat"><span>DELAY</span><b className={'mono' + (f.delay >= 8 ? ' delay-hot' : '')}>{f.delay > 0 ? '+' + f.delay + 'm' : '0m'}</b></div>
         </div>
